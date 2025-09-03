@@ -14,10 +14,11 @@ import numpy as np
 import psycopg
 from google.api_core import exceptions as api_exceptions
 from google.api_core.client_options import ClientOptions
-from google.cloud import aiplatform, documentai as docai_v1
+from google.cloud import aiplatform
+from google.cloud import documentai as docai_v1
 from google.cloud import firestore
-from google.cloud import secretmanager
 from google.cloud import storage
+from google.cloud.secretmanager import SecretManagerServiceClient
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from psycopg import sql
 from cloudevents.http import CloudEvent
@@ -55,8 +56,7 @@ log_buffer = []
 # --- Global, Thread-Safe Clients for Reuse ---
 db_conn = None
 db_lock = Lock()
-genai_client = None
-genai_client_lock = Lock()
+genai_client_lock = Lock() # genai_client is no longer a global object, but genai.configure is global
 
 def get_firestore_client(project_id: str, database: str = "(default)") -> firestore.Client:
     return firestore.Client(project=project_id, database=database)
@@ -69,13 +69,14 @@ def get_docai_client(location: str) -> docai_v1.DocumentProcessorServiceClient:
     return docai_v1.DocumentProcessorServiceClient(client_options=client_options)
 
 def initialize_genai_client():
-    """Initializes and returns a reusable, thread-safe genai.Client."""
-    global genai_client
+    """Initializes and configures the global genai client."""
     with genai_client_lock:
-        if genai_client is None:
-            logging.info("Initializing new Google GenAI client...")
+        # genai.configure is idempotent, so it's safe to call multiple times
+        # but we only need to do the secret fetching once.
+        if not hasattr(initialize_genai_client, 'configured'):
+            logging.info("Configuring Google GenAI client...")
             try:
-                client = secretmanager.SecretManagerServiceClient()
+                client = SecretManagerServiceClient()
                 project_id = os.environ["PROJECT_ID"]
                 secret_name = "gemini_api"
                 name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
@@ -85,12 +86,14 @@ def initialize_genai_client():
                 logging.info("genai configured with API key.")
             except api_exceptions.NotFound:
                 logging.warning("Gemini API key not found. Using Application Default Credentials (ADC).")
-            
-            # Pin to the stable 'v1' API for production reliability
-            genai_client = genai.Client(http_options=types.HttpOptions(api_version='v1'))
+            except Exception as e:
+                logging.error(f"Error configuring genai: {e}", exc_info=True)
+                raise
+            initialize_genai_client.configured = True
         else:
-            logging.info("Reusing existing Google GenAI client.")
-    return genai_client
+            logging.info("Google GenAI client already configured.")
+        # The genai_client global variable is not used in this new approach.
+        # The genai library operates globally after configuration.
 
 def get_db_connection():
     """Initializes and returns a reusable, thread-safe database connection."""
@@ -99,7 +102,7 @@ def get_db_connection():
         if db_conn is None or db_conn.closed:
             logging.info("No active DB connection. Initializing...")
             try:
-                client = secretmanager.SecretManagerServiceClient()
+                client = SecretManagerServiceClient()
                 project_id = os.environ["PROJECT_ID"]
                 secret_name = "db_retrieval_pass"
                 name = f"projects/{project_id}/secrets/{secret_name}/versions/latest"
@@ -214,7 +217,6 @@ def index_document_chunks(document_id: int, chunks: List[str], embeddings: np.nd
 
 def _call_generative_model(
     task_name: str,
-    client: genai.Client,
     model_name: str,
     system_prompt: str,
     user_prompt: str,
@@ -233,7 +235,7 @@ def _call_generative_model(
             if response_schema:
                 generation_config_params["response_schema"] = response_schema
         
-        model = client.generative_model(
+        model = genai.GenerativeModel(
             model_name=model_name,
             generation_config=generation_config_params
         )
@@ -278,7 +280,7 @@ def _get_context_from_rag(query_embedding: Optional[np.ndarray], db_conn, projec
         logging.error(f"Error during RAG retrieval: {e}", exc_info=True)
         return "Error retrieving historical context."
 
-def get_clean_document_text(input_file: str, mime_type: str, processor_id: str, temp_bucket: str, client: genai.Client) -> Optional[str]:
+def get_clean_document_text(input_file: str, mime_type: str, processor_id: str, temp_bucket: str) -> Optional[str]:
     _log(0, 0, "Extracting text with Document AI OCR...")
     try:
         docai_client = get_docai_client(os.environ["DOCAI_LOCATION"])
@@ -314,7 +316,7 @@ def get_clean_document_text(input_file: str, mime_type: str, processor_id: str, 
         
         if raw_text.strip():
             _log(0, 0, "OCR text extracted, now cleaning with GenAI...")
-            return _ai_text_restoration(raw_text, client)
+            return _ai_text_restoration(raw_text)
         else:
             _log(0, 0, "No text content found after OCR.", level="WARNING")
             return None
@@ -322,10 +324,9 @@ def get_clean_document_text(input_file: str, mime_type: str, processor_id: str, 
         logging.error(f"Generic OCR failure: {e}", exc_info=True)
         return None
 
-def _ai_text_restoration(text: str, client: genai.Client) -> str:
+def _ai_text_restoration(text: str) -> str:
     return _call_generative_model(
         "AI Text Restoration",
-        client=client,
         model_name=os.environ["CLEANING_MODEL"],
         system_prompt=(
             "The following text was extracted via OCR and may contain errors."
@@ -344,7 +345,6 @@ def generate_legal_analysis(
     instructions_bucket_name,
     master_instructions_file,
     analysis_model_name,
-    client: genai.Client,
     project_id,
     vertex_ai_location,
     index_endpoint_id,
@@ -376,7 +376,7 @@ def generate_legal_analysis(
     )
 
     analysis_text = _call_generative_model(
-        "Legal Analysis", client, analysis_model_name, system_prompt, user_prompt, is_json=True, response_schema=analysis_schema
+        "Legal Analysis", analysis_model_name, system_prompt, user_prompt, is_json=True, response_schema=analysis_schema
     )
     if not analysis_text:
         return None
@@ -522,7 +522,7 @@ def process_document_pipeline(filename: str, mime_type: str):
         
         firestore_db = get_firestore_client(project_id)
         storage_client = get_storage_client()
-        client = initialize_genai_client()
+        initialize_genai_client() # Configure genai globally
         aiplatform.init(project=project_id, location=os.environ["VERTEX_AI_LOCATION"])
         
         db_conn = get_db_connection()
@@ -567,7 +567,7 @@ def process_document_pipeline(filename: str, mime_type: str):
         # --- Step 1 & 2: Document Processing & Cleaning ---
         input_gcs_uri = f"gs://{input_bucket_name}/{filename}"
         _log(1, TOTAL_STEPS, "Extracting and cleaning text with OCR and AI...")
-        clean_text = get_clean_document_text(input_gcs_uri, mime_type, os.environ["DOCAI_PROCESSOR_ID"], json_bucket_name, client)
+        clean_text = get_clean_document_text(input_gcs_uri, mime_type, os.environ["DOCAI_PROCESSOR_ID"], json_bucket_name)
         if not clean_text:
             raise ValueError("OCR process resulted in no clean text.")
         _log(2, TOTAL_STEPS, "Text extraction and cleaning complete.")
@@ -597,7 +597,7 @@ def process_document_pipeline(filename: str, mime_type: str):
         # --- Step 5 & 6: Legal Analysis and Persistence ---
         analysis = generate_legal_analysis(
             clean_text, db_conn, embeddings, storage_client, os.environ["INSTRUCTIONS_BUCKET"],
-            os.environ["MASTER_INSTRUCTIONS_FILE"], os.environ["ANALYSIS_MODEL"], client, project_id,
+            os.environ["MASTER_INSTRUCTIONS_FILE"], os.environ["ANALYSIS_MODEL"], project_id,
             os.environ["VERTEX_AI_LOCATION"], os.environ["INDEX_ENDPOINT_ID"], os.environ["DEPLOYED_INDEX_ID"]
         )
         
