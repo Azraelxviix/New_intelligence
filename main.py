@@ -14,14 +14,17 @@ import numpy as np
 import psycopg
 from google.api_core import exceptions as api_exceptions
 from google.api_core.client_options import ClientOptions
-from google.cloud import aiplatform, documentai as docai_v1, firestore, secretmanager, storage
+from google.cloud import aiplatform, documentai as docai_v1
+from google.cloud import firestore
+from google.cloud import secretmanager
+from google.cloud import storage
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from psycopg import sql
-from sentence_transformers import SentenceTransformer
 from cloudevents.http import CloudEvent
 
 import google.generativeai as genai
 from google.genai import types
+from vertexai.language_models import TextEmbeddingModel
 
 SCRIPT_VERSION = "17.0.0"
 LOCK_LEASE_MINUTES = 20
@@ -44,6 +47,7 @@ os.environ["DB_NAME"] = "postgres"
 os.environ["INSTANCE_CONNECTION_NAME"] = "thebestever:us-central1:genai-rag-db-6bdb68ec"
 os.environ["ANALYSIS_MODEL"] = "gemini-1.5-pro"  # Use stable alias
 os.environ["CLEANING_MODEL"] = "gemini-1.5-flash" # Use stable alias
+os.environ["EMBEDDING_MODEL_NAME"] = "text-embedding-gecko@001" # Vertex AI Embedding Model
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log_buffer = []
@@ -149,12 +153,14 @@ EMBEDDING_MODEL = None
 def _get_embedding_model():
     global EMBEDDING_MODEL
     if EMBEDDING_MODEL is None:
-        _log(0, 0, "LAZY LOADING: Initializing SentenceTransformer model 'all-mpnet-base-v2'...")
-        EMBEDDING_MODEL = SentenceTransformer('sentence-transformers/all-mpnet-base-v2')
-        test_embedding = EMBEDDING_MODEL.encode(["test sentence"])[0]
-        _log(0, 0, f"LAZY LOADING: SentenceTransformer model loaded successfully with {len(test_embedding)} dimensions.")
+        _log(0, 0, f"LAZY LOADING: Initializing Vertex AI TextEmbeddingModel '{os.environ['EMBEDDING_MODEL_NAME']}'...")
+        EMBEDDING_MODEL = TextEmbeddingModel.from_pretrained(os.environ["EMBEDDING_MODEL_NAME"])
+        test_embedding_response = EMBEDDING_MODEL.get_embeddings(["test sentence"])
+        test_embedding = test_embedding_response[0].values
+        _log(0, 0, f"LAZY LOADING: Vertex AI TextEmbeddingModel loaded successfully with {len(test_embedding)} dimensions.")
+        # text-embedding-gecko@001 has 768 dimensions
         if len(test_embedding) != 768:
-            raise ValueError(f"Expected 768 dimensions, got {len(test_embedding)}")
+            raise ValueError(f"Expected 768 dimensions for '{os.environ['EMBEDDING_MODEL_NAME']}', got {len(test_embedding)}")
     return EMBEDDING_MODEL
 
 def check_and_reserve_document(case_id: int, document_name: str, db_conn) -> Optional[int]:
@@ -177,7 +183,7 @@ def check_and_reserve_document(case_id: int, document_name: str, db_conn) -> Opt
 
 def update_document_with_content(document_id: int, document_text: str, chunk_embeddings: Optional[np.ndarray], db_conn) -> None:
     with db_conn.cursor() as cur:
-        embedding = None
+        embedding: Optional[List[float]] = None
         if chunk_embeddings is not None and len(chunk_embeddings) > 0:
             embedding = np.mean(chunk_embeddings, axis=0).tolist()
         cur.execute(
@@ -264,7 +270,7 @@ def _get_context_from_rag(query_embedding: Optional[np.ndarray], db_conn, projec
             if not neighbor_ids:
                 return "No relevant historical context found in Vector Search (no valid IDs)."
             query = sql.SQL("SELECT chunk_text, (embedding <=> %s) AS distance FROM document_chunks WHERE id = ANY(%s) ORDER BY distance ASC")
-            cur.execute(query, (str(query_vec), neighbor_ids))
+            cur.execute(query, (query_vec, neighbor_ids))
             results = cur.fetchall()
             context = [f"- (Distance: {row[1]:.4f}): {row[0]}" for row in results]
             return "\n".join(context) if context else "No relevant historical context found."
@@ -437,7 +443,7 @@ def _persist_analysis_hierarchical(
             update_document_with_content(document_id, clean_text, chunk_embeddings, db_conn)
             if chunk_embeddings is not None and len(chunk_embeddings) > 0:
                 chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=200, length_function=len).split_text(clean_text)
-                index_document_chunks(document_id, chunks, embeddings, db_conn)
+                index_document_chunks(document_id, chunks, chunk_embeddings, db_conn)
             logging.info(f"Cloud SQL persist complete for {doc_id}.")
         except Exception as e:
             logging.error(f"CRITICAL: Failed to persist data to Cloud SQL for '{doc_id}': {e}", exc_info=True)
@@ -573,7 +579,13 @@ def process_document_pipeline(filename: str, mime_type: str):
         embeddings = None
         if chunks:
             model = _get_embedding_model()
-            embeddings = model.encode(chunks, batch_size=16)
+            # Vertex AI embedding models have a limit of 5 chunks per request
+            all_embeddings = []
+            for i in range(0, len(chunks), 5):
+                batch_chunks = chunks[i:i+5]
+                response = model.get_embeddings(batch_chunks)
+                all_embeddings.extend([embedding.values for embedding in response])
+            embeddings = np.array(all_embeddings)
         _log(3, TOTAL_STEPS, f"Generated {len(embeddings) if embeddings is not None else 0} embeddings.")
         
         # Persist to SQL early
