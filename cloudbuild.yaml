@@ -33,7 +33,12 @@ steps:
   - |
     IMAGE_BASE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}
     NEW_IMAGE_URI=$${IMAGE_BASE}:latest
+    echo "DEBUG: NEW_IMAGE_URI is $${NEW_IMAGE_URI}"
+    echo "DEBUG: service.yaml BEFORE sed:"
+    cat service.yaml
     sed -i "s|image: .*/knowledge-base-webhook.*|image: $${NEW_IMAGE_URI}|g" service.yaml
+    echo "DEBUG: service.yaml AFTER sed:"
+    cat service.yaml
   waitFor: ['Push-Images']
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
   id: 'Deploy-Service'
