@@ -20,7 +20,6 @@ spec:
     metadata:
       annotations:
         run.googleapis.com/execution-environment: gen2
-        run.googleapis.com/cloudsql-instances: "thebestever:us-central1:genai-rag-db-6bdb68ec"
         autoscaling.knative.dev/maxScale: '2'
         run.googleapis.com/startup-cpu-boost: 'true'
     spec:
@@ -58,33 +57,23 @@ spec:
               value: "analysis_1756251260790"
             - name: MASTER_INSTRUCTIONS_FILE
               value: "master_instructions.txt"
-            - name: DB_USER
-              value: "retrieval-service"
-            - name: DB_NAME
-              value: "postgres"
-            - name: INSTANCE_CONNECTION_NAME
-              value: "thebestever:us-central1:genai-rag-db-6bdb68ec"
             - name: ANALYSIS_MODEL
               value: "models/gemini-2.5-pro"
             - name: CLEANING_MODEL
               value: "models/gemini-2.5-flash"
+            - name: DB_IAM_PRINCIPAL
+              value: "genai-rag-run-sa-6bdb68ec@thebestever.iam.gserviceaccount.com"
+            - name: DB_NAME
+              value: "postgres"
+            - name: INSTANCE_CONNECTION_NAME
+              value: "thebestever:us-central1:genai-rag-db-6bdb68ec"
+            - name: ENABLE_DB
+              value: "0"
+            - name: USE_PRIVATE_IP
+              value: "0"
+            - name: EMBEDDING_MODEL
+              value: "textembedding-gecko@003"
           resources:
             limits:
               cpu: "4"
               memory: "8Gi"
-        - name: cloud-sql-proxy
-          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.4
-          args:
-            - "--structured-logs"
-            - "--port=5432"
-            - "--address=127.0.0.1"
-            - "thebestever:us-central1:genai-rag-db-6bdb68ec"
-          securityContext:
-            runAsUser: 1000
-          resources:
-            requests:
-              memory: "2Gi"
-              cpu: "1"
-            limits:
-              memory: "2Gi"
-              cpu: "1"

@@ -5,3 +5,12 @@ __pycache__/
 *.pyc
 *.log
 *.md
+venv/
+data/
+output/
+docs/
+node_modules/
+win/
+git add .
+git commit -m "Commit all project files"
+git push

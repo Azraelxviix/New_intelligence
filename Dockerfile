@@ -32,4 +32,4 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 COPY main.py .
 
-CMD ["functions-framework", "--target=on_cloud_event"]
+CMD sh -c "functions-framework --target=on_cloud_event --port=$PORT"

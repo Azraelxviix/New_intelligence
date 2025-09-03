@@ -14,7 +14,7 @@ import numpy as np
 import psycopg
 from google.api_core import exceptions as api_exceptions
 from google.api_core.client_options import ClientOptions
-from google.cloud import aiplatform
+import google.cloud.aiplatform as aiplatform
 from google.cloud import documentai as docai_v1
 from google.cloud import firestore
 from google.cloud import storage

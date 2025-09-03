@@ -31,6 +31,7 @@ steps:
   args:
   - '-c'
   - |
+    set -x
     IMAGE_BASE=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY}/${_SERVICE_NAME}
     NEW_IMAGE_URI=$${IMAGE_BASE}:latest
     echo "DEBUG: NEW_IMAGE_URI is $${NEW_IMAGE_URI}"
